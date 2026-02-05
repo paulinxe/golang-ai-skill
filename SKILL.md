@@ -499,6 +499,10 @@ http.Handle("/api/", loggingMiddleware(apiHandler))
 **Authentication Middleware:**
 
 ```go
+// Use custom type for context keys to avoid collisions between packages
+type contextKey string
+const userIDKey contextKey = "userID"
+
 func authMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         token := r.Header.Get("Authorization")
@@ -507,9 +511,8 @@ func authMiddleware(next http.Handler) http.Handler {
             return
         }
         
-        // Add user info to context
         userID := extractUserID(token)
-        ctx := context.WithValue(r.Context(), "userID", userID)
+        ctx := context.WithValue(r.Context(), userIDKey, userID)
         next.ServeHTTP(w, r.WithContext(ctx))
     })
 }
@@ -518,27 +521,40 @@ func authMiddleware(next http.Handler) http.Handler {
 **CORS Middleware:**
 
 ```go
-func corsMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Access-Control-Allow-Origin", "*")
-        w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        
-        if r.Method == "OPTIONS" {
-            w.WriteHeader(http.StatusOK)
-            return
-        }
-        
-        next.ServeHTTP(w, r)
-    })
+// allowedOrigins: use specific origins in production, e.g. []string{"https://myapp.com"}
+// Avoid "*" in production - it allows any site to make credentialed requests
+func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
+    originSet := make(map[string]bool)
+    for _, o := range allowedOrigins {
+        originSet[o] = true
+    }
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            origin := r.Header.Get("Origin")
+            if origin != "" && (len(originSet) == 0 || originSet["*"] || originSet[origin]) {
+                w.Header().Set("Access-Control-Allow-Origin", origin)
+            }
+            w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            
+            if r.Method == "OPTIONS" {
+                w.WriteHeader(http.StatusOK)
+                return
+            }
+            
+            next.ServeHTTP(w, r)
+        })
+    }
 }
+
+// Usage: corsMiddleware([]string{"https://myapp.com"})(handler) or corsMiddleware([]string{"*"})(handler) for dev
 ```
 
 **Middleware Chaining:**
 
 ```go
-// Manual chaining
-handler := loggingMiddleware(authMiddleware(corsMiddleware(apiHandler)))
+// Manual chaining (corsMiddleware takes allowed origins, returns middleware)
+handler := loggingMiddleware(authMiddleware(corsMiddleware([]string{"https://myapp.com"})(apiHandler)))
 http.Handle("/api/", handler)
 
 // Helper function for cleaner chaining
@@ -550,7 +566,7 @@ func chain(h http.Handler, middleware ...func(http.Handler) http.Handler) http.H
 }
 
 // Usage
-handler := chain(apiHandler, loggingMiddleware, authMiddleware, corsMiddleware)
+handler := chain(apiHandler, loggingMiddleware, authMiddleware, corsMiddleware([]string{"https://myapp.com"}))
 ```
 
 **Popular Router with Middleware (chi):**
@@ -563,7 +579,7 @@ func main() {
     
     // Global middleware
     r.Use(loggingMiddleware)
-    r.Use(corsMiddleware)
+    r.Use(corsMiddleware([]string{"https://myapp.com"}))
     
     // Public routes
     r.Post("/auth/login", loginHandler)
@@ -688,11 +704,24 @@ import (
     "net/http"
 )
 
-var upgrader = websocket.Upgrader{
-    CheckOrigin: func(r *http.Request) bool {
-        return true // Configure properly in production
-    },
+// allowedOrigins: in production, use your app's origins e.g. []string{"https://myapp.com"}
+func newUpgrader(allowedOrigins []string) websocket.Upgrader {
+    originSet := make(map[string]bool)
+    for _, o := range allowedOrigins {
+        originSet[o] = true
+    }
+    return websocket.Upgrader{
+        CheckOrigin: func(r *http.Request) bool {
+            origin := r.Header.Get("Origin")
+            if origin == "" {
+                return true
+            }
+            return originSet["*"] || originSet[origin]
+        },
+    }
 }
+
+var upgrader = newUpgrader([]string{"*"}) // Replace with specific origins in production
 
 type Hub struct {
     clients    map[*Client]bool
@@ -890,6 +919,21 @@ func merge(cs ...<-chan int) <-chan int {
 **Cancellation with Done Channel:**
 
 ```go
+func gen(done <-chan struct{}, nums ...int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for _, n := range nums {
+            select {
+            case out <- n:
+            case <-done:
+                return
+            }
+        }
+    }()
+    return out
+}
+
 func sq(done <-chan struct{}, in <-chan int) <-chan int {
     out := make(chan int)
     go func() {
@@ -1032,6 +1076,12 @@ func Query(conns []Conn, query string) Result {
 **Serial MD5 Calculation:**
 
 ```go
+import (
+    "crypto/md5"
+    "os"
+    "path/filepath"
+)
+
 func MD5All(root string) (map[string][md5.Size]byte, error) {
     m := make(map[string][md5.Size]byte)
     err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -1041,7 +1091,7 @@ func MD5All(root string) (map[string][md5.Size]byte, error) {
         if !info.Mode().IsRegular() {
             return nil
         }
-        data, err := ioutil.ReadFile(path)
+        data, err := os.ReadFile(path)
         if err != nil {
             return err
         }
@@ -1055,6 +1105,13 @@ func MD5All(root string) (map[string][md5.Size]byte, error) {
 **Parallel MD5 with Pipeline:**
 
 ```go
+import (
+    "crypto/md5"
+    "errors"
+    "os"
+    "path/filepath"
+)
+
 type result struct {
     path string
     sum  [md5.Size]byte
@@ -1075,11 +1132,12 @@ func sumFiles(done <-chan struct{}, root string) (<-chan result, <-chan error) {
                 return nil
             }
 
-            // Start goroutine for each file
+            // Start goroutine for each file (capture path to avoid closure bug)
+            filePath := path
             go func() {
-                data, err := ioutil.ReadFile(path)
+                data, err := os.ReadFile(filePath)
                 select {
-                case c <- result{path, md5.Sum(data), err}:
+                case c <- result{filePath, md5.Sum(data), err}:
                 case <-done:
                 }
             }()
@@ -1708,6 +1766,14 @@ func BenchmarkUserValidation(b *testing.B) {
 ### HTTP Handler Testing
 
 ```go
+import (
+    "encoding/json"
+    "io"
+    "net/http"
+    "net/http/httptest"
+    "testing"
+)
+
 func TestHandler(t *testing.T) {
     req := httptest.NewRequest("GET", "/api/users", nil)
     w := httptest.NewRecorder()
@@ -1719,7 +1785,7 @@ func TestHandler(t *testing.T) {
         t.Errorf("expected status 200, got %d", resp.StatusCode)
     }
 
-    body, _ := ioutil.ReadAll(resp.Body)
+    body, _ := io.ReadAll(resp.Body)
     var users []User
     if err := json.Unmarshal(body, &users); err != nil {
         t.Errorf("Failed to parse response: %v", err)
