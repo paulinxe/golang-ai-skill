@@ -2665,6 +2665,26 @@ for _, v := range values {
 - Use internal/ directory for non-public code
 - Group by feature/domain, not by layer (in most cases)
 
+### 8. Constructor and factory functions
+
+- Prefer returning a pointer when creating a new struct: `func New() *TheStruct` instead of `func New() TheStruct`.
+- Returning `*T` avoids copying the struct, allows returning `nil` on failure, and matches typical method receivers on `*T`. It is the idiomatic choice for constructor/factory functions.
+
+```go
+// Preferred: return pointer
+func NewUserService(repo UserRepository, logger *slog.Logger) *UserService {
+    return &UserService{repo: repo, logger: logger}
+}
+
+// Optional: return nil on invalid config
+func NewConfig(path string) (*Config, error) {
+    if path == "" {
+        return nil, errors.New("config path required")
+    }
+    return &Config{Path: path}, nil
+}
+```
+
 ## Common Pitfalls
 
 ### 1. Race Conditions
