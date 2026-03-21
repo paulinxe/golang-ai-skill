@@ -383,14 +383,15 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 **Struct Tags and Security:**
 
 ```go
+// Wider fields before narrower ones reduces padding when many Users live in a slice (see Best Practices: struct field layout).
 type User struct {
-    ID        int       `json:"id"`
-    Email     string    `json:"email"`
-    Name      string    `json:"name"`
-    Password  string    `json:"-"`                    // Never send password in JSON
     CreatedAt time.Time `json:"created_at"`
     UpdatedAt time.Time `json:"updated_at,omitempty"` // Omit if zero value
     DeletedAt *time.Time `json:"deleted_at,omitempty"` // Omit if nil
+    Email     string    `json:"email"`
+    Name      string    `json:"name"`
+    Password  string    `json:"-"`                    // Never send password in JSON
+    ID        int       `json:"id"`
 }
 
 // Separate request/response types for better security
@@ -401,10 +402,10 @@ type CreateUserRequest struct {
 }
 
 type UserResponse struct {
-    ID        int       `json:"id"`
+    CreatedAt time.Time `json:"created_at"`
     Email     string    `json:"email"`
     Name      string    `json:"name"`
-    CreatedAt time.Time `json:"created_at"`
+    ID        int       `json:"id"`
 }
 ```
 
@@ -1394,9 +1395,9 @@ func batchInsert(ctx context.Context, db *sql.DB, users []*User) error {
 import "github.com/jmoiron/sqlx"
 
 type User struct {
-    ID    int    `db:"id"`
     Name  string `db:"name"`
     Email string `db:"email"`
+    ID    int    `db:"id"`
 }
 
 func getUser(ctx context.Context, db *sqlx.DB, userID int) (*User, error) {
@@ -1932,16 +1933,16 @@ func main() {
 import "github.com/caarlos0/env/v10"
 
 type Config struct {
-    ServerPort     int           `env:"PORT" envDefault:"8080"`
     DBHost         string        `env:"DB_HOST" envDefault:"localhost"`
-    DBPort         int           `env:"DB_PORT" envDefault:"5432"`
     DBUser         string        `env:"DB_USER" envDefault:"postgres"`
     DBPassword     string        `env:"DB_PASSWORD,required"`
     DBName         string        `env:"DB_NAME" envDefault:"myapp"`
     LogLevel       string        `env:"LOG_LEVEL" envDefault:"info"`
+    Environment    string        `env:"ENVIRONMENT" envDefault:"development"`
+    ServerPort     int           `env:"PORT" envDefault:"8080"`
+    DBPort         int           `env:"DB_PORT" envDefault:"5432"`
     Timeout        time.Duration `env:"TIMEOUT" envDefault:"30s"`
     MaxConnections int           `env:"MAX_CONNECTIONS" envDefault:"25"`
-    Environment    string        `env:"ENVIRONMENT" envDefault:"development"`
 }
 
 func loadConfig() (*Config, error) {
@@ -2023,8 +2024,8 @@ func rateLimitMiddleware(limiter *rate.Limiter) func(http.Handler) http.Handler 
 
 // Per-IP rate limiting
 type IPRateLimiter struct {
-    limiters map[string]*rate.Limiter
     mu       sync.RWMutex
+    limiters map[string]*rate.Limiter
     rate     rate.Limit
     burst    int
 }
@@ -2227,8 +2228,8 @@ func loggingInterceptor(
 
 ```go
 type ServiceRegistry struct {
-    services map[string][]string
     mu       sync.RWMutex
+    services map[string][]string
 }
 
 func NewServiceRegistry() *ServiceRegistry {
@@ -2303,12 +2304,12 @@ func (r *ServiceRegistry) checkHealth() {
 
 ```go
 type CircuitBreaker struct {
-    maxFailures int
-    timeout     time.Duration
-    failures    int
     lastFailure time.Time
-    state       string  // closed, open, half-open
+    timeout     time.Duration
+    state       string // closed, open, half-open
     mu          sync.Mutex
+    maxFailures int
+    failures    int
 }
 
 func NewCircuitBreaker(maxFailures int, timeout time.Duration) *CircuitBreaker {
@@ -2525,6 +2526,7 @@ for _, v := range values {
 - Use buffered channels for known capacity
 - Avoid unnecessary allocations in hot paths
 - Reuse HTTP clients (they maintain connection pools)
+- Order struct fields to minimize padding in hot types (see **Struct field layout** below); measure with `unsafe.Sizeof` or the `fieldalignment` analyzer—reordering often leaves size unchanged, but bad interleaving can waste space and cache lines
 
 ### 5. Security
 
@@ -2575,6 +2577,36 @@ func NewConfig(path string) (*Config, error) {
     return &Config{Path: path}, nil
 }
 ```
+
+### 9. Struct field layout (alignment and padding)
+
+Go lays out struct fields in **declaration order** and inserts padding so each field satisfies its type’s alignment. Tags (`json`, `db`, `env`, …) do **not** affect memory layout—only the order of fields in the source does.
+
+**Heuristic for hot-path structs** (large slices or arrays, tight loops, game/engine code): declare fields from **larger alignment / wider types toward smaller ones**—for example `int64`, pointers, `string`, `time.Time`, and mutexes before `bool`, `int8`, or `int32`—so small fields cluster at the end instead of splitting wide fields apart.
+
+**When it matters:** interleaving narrow and wide fields can add padding *between* fields. A compact pattern is to keep wide fields contiguous and place `bool` and other 1-byte types last (or grouped), avoiding a layout like “`int64`, `bool`, `int64`” which forces the second `int64` onto a new alignment slot.
+
+```go
+// Looser layout: bool between int64s adds a gap before the second int64.
+type Loose struct {
+    x int64
+    a bool
+    y int64
+    b bool
+}
+
+// Tighter: wide fields together, small fields after.
+type Tight struct {
+    x, y int64
+    a, b bool
+}
+```
+
+On typical 64-bit builds (e.g. `linux/amd64`), `unsafe.Sizeof(Loose{})` is **32** bytes and `unsafe.Sizeof(Tight{})` is **24** bytes—same field types, different declaration order.
+
+**Reality check:** on common 64-bit layouts, two orderings of the *same* field set often produce the **same** `unsafe.Sizeof` (your own checks may show no difference). The rule is still worth knowing for mixed-size designs; verify with `unsafe.Sizeof(T{})` or run the [`fieldalignment` analyzer](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/fieldalignment) on packages you care about.
+
+**Tradeoff:** for request/response DTOs used once per handler, readability (e.g. `ID` first) can outweigh a few bytes. Apply field ordering where allocation volume or cache behavior actually matters, and let profiling drive the decision.
 
 ## Common Pitfalls
 
